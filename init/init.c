@@ -153,13 +153,13 @@ void service_start(struct service *svc, const char *dynamic_args)
     int needs_console;
     int n;
 
-        /* starting a service removes it from the disabled
+        /* starting a service removes it from the disabled or reset
          * state and immediately takes it out of the restarting
          * state if it was in there
          */
-    svc->flags &= (~(SVC_DISABLED|SVC_RESTARTING));
+    svc->flags &= (~(SVC_DISABLED|SVC_RESTARTING|SVC_RESET));
     svc->time_started = 0;
-    
+
         /* running processes require no additional work -- if
          * they're in the process of exiting, we've ensured
          * that they will immediately restart on exit, unless
@@ -246,13 +246,22 @@ void service_start(struct service *svc, const char *dynamic_args)
 
     /* as requested, set our gid, supplemental gids, and uid */
         if (svc->gid) {
-            setgid(svc->gid);
+            if (setgid(svc->gid) != 0) {
+                ERROR("setgid failed: %s\n", strerror(errno));
+                _exit(127);
+            }
         }
         if (svc->nr_supp_gids) {
-            setgroups(svc->nr_supp_gids, svc->supp_gids);
+            if (setgroups(svc->nr_supp_gids, svc->supp_gids) != 0) {
+                ERROR("setgroups failed: %s\n", strerror(errno));
+                _exit(127);
+            }
         }
         if (svc->uid) {
-            setuid(svc->uid);
+            if (setuid(svc->uid) != 0) {
+                ERROR("setuid failed: %s\n", strerror(errno));
+                _exit(127);
+            }
         }
 
         if (!dynamic_args) {
@@ -294,25 +303,44 @@ void service_start(struct service *svc, const char *dynamic_args)
         notify_service_state(svc->name, "running");
 }
 
-void service_stop(struct service *svc)
+/* The how field should be either SVC_DISABLED or SVC_RESET */
+static void service_stop_or_reset(struct service *svc, int how)
 {
         /* we are no longer running, nor should we
          * attempt to restart
          */
     svc->flags &= (~(SVC_RUNNING|SVC_RESTARTING));
 
+    if ((how != SVC_DISABLED) && (how != SVC_RESET)) {
+        /* Hrm, an illegal flag.  Default to SVC_DISABLED */
+        how = SVC_DISABLED;
+    }
         /* if the service has not yet started, prevent
          * it from auto-starting with its class
          */
-    svc->flags |= SVC_DISABLED;
+    if (how == SVC_RESET) {
+        svc->flags |= (svc->flags & SVC_RC_DISABLED) ? SVC_DISABLED : SVC_RESET;
+    } else {
+        svc->flags |= how;
+    }
 
     if (svc->pid) {
         NOTICE("service '%s' is being killed\n", svc->name);
-        kill(-svc->pid, SIGTERM);
+        kill(-svc->pid, SIGKILL);
         notify_service_state(svc->name, "stopping");
     } else {
         notify_service_state(svc->name, "stopped");
     }
+}
+
+void service_reset(struct service *svc)
+{
+    service_stop_or_reset(svc, SVC_RESET);
+}
+
+void service_stop(struct service *svc)
+{
+    service_stop_or_reset(svc, SVC_DISABLED);
 }
 
 void property_changed(const char *name, const char *value)
@@ -360,7 +388,7 @@ static void msg_start(const char *name)
 
         svc = service_find_by_name(tmp);
     }
-    
+
     if (svc) {
         service_start(svc, args);
     } else {
@@ -387,6 +415,9 @@ void handle_control_message(const char *msg, const char *arg)
         msg_start(arg);
     } else if (!strcmp(msg,"stop")) {
         msg_stop(arg);
+    } else if (!strcmp(msg,"restart")) {
+        msg_stop(arg);
+        msg_start(arg);
     } else {
         ERROR("unknown control msg '%s'\n", msg);
     }
@@ -447,43 +478,11 @@ static void import_kernel_nv(char *name, int in_qemu)
     }
 }
 
-static void import_kernel_cmdline(int in_qemu)
-{
-    char cmdline[1024];
-    char *ptr;
-    int fd;
-
-    fd = open("/proc/cmdline", O_RDONLY);
-    if (fd >= 0) {
-        int n = read(fd, cmdline, 1023);
-        if (n < 0) n = 0;
-
-        /* get rid of trailing newline, it happens */
-        if (n > 0 && cmdline[n-1] == '\n') n--;
-
-        cmdline[n] = 0;
-        close(fd);
-    } else {
-        cmdline[0] = 0;
-    }
-
-    ptr = cmdline;
-    while (ptr && *ptr) {
-        char *x = strchr(ptr, ' ');
-        if (x != 0) *x++ = 0;
-        import_kernel_nv(ptr, in_qemu);
-        ptr = x;
-    }
-
-        /* don't expose the raw commandline to nonpriv processes */
-    chmod("/proc/cmdline", 0440);
-}
-
 static struct command *get_first_command(struct action *act)
 {
     struct listnode *node;
     node = list_head(&act->commands);
-    if (!node)
+    if (!node || list_empty(&act->commands))
         return NULL;
 
     return node_to_item(node, struct command, clist);
@@ -540,8 +539,12 @@ static int wait_for_coldboot_done_action(int nargs, char **args)
 
 static int property_init_action(int nargs, char **args)
 {
+    bool load_defaults = true;
+
     INFO("property init\n");
-    property_init();
+    if (!strcmp(bootmode, "charger"))
+        load_defaults = false;
+    property_init(load_defaults);
     return 0;
 }
 
@@ -597,7 +600,7 @@ static int set_init_properties_action(int nargs, char **args)
     char tmp[PROP_VALUE_MAX];
 
     if (qemu[0])
-        import_kernel_cmdline(1);
+        import_kernel_cmdline(1, import_kernel_nv);
 
     if (!strcmp(bootmode,"factory"))
         property_set("ro.factorytest", "1");
@@ -611,6 +614,7 @@ static int set_init_properties_action(int nargs, char **args)
     property_set("ro.baseband", baseband[0] ? baseband : "unknown");
     property_set("ro.carrier", carrier[0] ? carrier : "unknown");
     property_set("ro.bootloader", bootloader[0] ? bootloader : "unknown");
+
     property_set("ro.hardware", hardware);
     snprintf(tmp, PROP_VALUE_MAX, "%d", revision);
     property_set("ro.revision", tmp);
@@ -643,6 +647,10 @@ static int check_startup_action(int nargs, char **args)
         ERROR("init startup failure\n");
         exit(1);
     }
+
+        /* signal that we hit this point */
+    unlink("/dev/.booting");
+
     return 0;
 }
 
@@ -695,12 +703,15 @@ int main(int argc, char **argv)
     mkdir("/proc", 0755);
     mkdir("/sys", 0755);
 
-    mount("tmpfs", "/dev", "tmpfs", 0, "mode=0755");
+    mount("tmpfs", "/dev", "tmpfs", MS_NOSUID, "mode=0755");
     mkdir("/dev/pts", 0755);
     mkdir("/dev/socket", 0755);
     mount("devpts", "/dev/pts", "devpts", 0, NULL);
     mount("proc", "/proc", "proc", 0, NULL);
     mount("sysfs", "/sys", "sysfs", 0, NULL);
+
+        /* indicate that booting is in progress to background fw loaders, etc */
+    close(open("/dev/.booting", O_WRONLY | O_CREAT, 0000));
 
         /* We must have some place other than / to create the
          * device nodes for kmsg and null, otherwise we won't
@@ -710,12 +721,12 @@ int main(int argc, char **argv)
          */
     open_devnull_stdio();
     log_init();
-    
+
     INFO("reading config file\n");
     init_parse_config_file("/init.rc");
 
     /* pull the kernel commandline and ramdisk properties file in */
-    import_kernel_cmdline(0);
+    import_kernel_cmdline(0, import_kernel_nv);
 
 #ifdef BOARD_PROVIDES_BOOTMODE
     /* Samsung Galaxy S: special bootmode for recovery
@@ -726,6 +737,8 @@ int main(int argc, char **argv)
     else
 #endif
      {
+        /* don't expose the raw commandline to nonpriv processes */
+        chmod("/proc/cmdline", 0440);
         get_hardware_name(hardware, &revision);
         snprintf(tmp, sizeof(tmp), "/init.%s.rc", hardware);
         init_parse_config_file(tmp);
@@ -745,11 +758,16 @@ int main(int argc, char **argv)
     queue_builtin_action(console_init_action, "console_init");
     queue_builtin_action(set_init_properties_action, "set_init_properties");
 
-        /* execute all the boot actions to get us started */
+    /* execute all the boot actions to get us started */
     action_for_each_trigger("init", action_add_queue_tail);
-    action_for_each_trigger("early-fs", action_add_queue_tail);
-    action_for_each_trigger("fs", action_add_queue_tail);
-    action_for_each_trigger("post-fs", action_add_queue_tail);
+
+    /* skip mounting filesystems in charger mode */
+    if (strcmp(bootmode, "charger") != 0) {
+        action_for_each_trigger("early-fs", action_add_queue_tail);
+        action_for_each_trigger("fs", action_add_queue_tail);
+        action_for_each_trigger("post-fs", action_add_queue_tail);
+        action_for_each_trigger("post-fs-data", action_add_queue_tail);
+    }
 
     queue_builtin_action(property_service_init_action, "property_service_init");
     queue_builtin_action(signal_init_action, "signal_init");
@@ -760,9 +778,12 @@ int main(int argc, char **argv)
         action_for_each_trigger("boot-pause", action_add_queue_tail);
     }
 
-    /* execute all the boot actions to get us started */
-    action_for_each_trigger("early-boot", action_add_queue_tail);
-    action_for_each_trigger("boot", action_add_queue_tail);
+    if (!strcmp(bootmode, "charger")) {
+        action_for_each_trigger("charger", action_add_queue_tail);
+    } else {
+        action_for_each_trigger("early-boot", action_add_queue_tail);
+        action_for_each_trigger("boot", action_add_queue_tail);
+    }
 
         /* run all property triggers based on current state of the properties */
     queue_builtin_action(queue_property_triggers_action, "queue_propety_triggers");

@@ -58,13 +58,18 @@ struct {
     unsigned int uid;
     unsigned int gid;
 } property_perms[] = {
+    { "net.rmnet0.",      AID_RADIO,    0 },
     { "net.rmnet",        AID_RADIO,    0 },
     { "net.gprs.",        AID_RADIO,    0 },
     { "net.ppp",          AID_RADIO,    0 },
+    { "net.qmi",          AID_RADIO,    0 },
+    { "net.lte",          AID_RADIO,    0 },
+    { "net.cdma",         AID_RADIO,    0 },
     { "ril.",             AID_RADIO,    0 },
     { "gsm.",             AID_RADIO,    0 },
     { "persist.radio",    AID_RADIO,    0 },
     { "net.dns",          AID_RADIO,    0 },
+    { "sys.usb.config",   AID_RADIO,    0 },
     { "net.gannet",       AID_RADIO,    0 },
     { "net.",             AID_SYSTEM,   0 },
     { "dev.",             AID_SYSTEM,   0 },
@@ -81,6 +86,7 @@ struct {
     { "debug.",           AID_SHELL,    0 },
     { "log.",             AID_SHELL,    0 },
     { "service.adb.root", AID_SHELL,    0 },
+    { "service.adb.tcp.port", AID_SHELL,    0 },
     { "persist.sys.",     AID_SYSTEM,   0 },
     { "persist.service.", AID_SYSTEM,   0 },
     { "persist.service.", AID_RADIO,    0 },
@@ -108,6 +114,7 @@ struct {
     unsigned int gid;
 } control_perms[] = {
     { "dumpstate",   AID_SHELL, AID_LOG   },
+    { "ril-daemon",  AID_RADIO, AID_RADIO },
     { "rawip_vsnet1",AID_RADIO, AID_RADIO },
     { "rawip_vsnet2",AID_RADIO, AID_RADIO },
     { "rawip_vsnet3",AID_RADIO, AID_RADIO },
@@ -433,8 +440,8 @@ void handle_property_set_fd()
             if (check_control_perms(msg.value, cr.uid, cr.gid)) {
                 handle_control_message((char*) msg.name + 4, (char*) msg.value);
             } else {
-                ERROR("sys_prop: Unable to %s service ctl [%s] uid: %d pid:%d\n",
-                        msg.name + 4, msg.value, cr.uid, cr.pid);
+                ERROR("sys_prop: Unable to %s service ctl [%s] uid:%d gid:%d pid:%d\n",
+                        msg.name + 4, msg.value, cr.uid, cr.gid, cr.pid);
             }
         } else {
             if (check_perms(msg.name, cr.uid, cr.gid)) {
@@ -542,15 +549,28 @@ static void load_persistent_properties()
     persistent_properties_loaded = 1;
 }
 
-void property_init(void)
+void property_init(bool load_defaults)
 {
     init_property_area();
-    load_properties_from_file(PROP_PATH_RAMDISK_DEFAULT);
+    if (load_defaults)
+        load_properties_from_file(PROP_PATH_RAMDISK_DEFAULT);
 }
 
 int properties_inited(void)
 {
     return property_area_inited;
+}
+
+/* When booting an encrypted system, /data is not mounted when the
+ * property service is started, so any properties stored there are
+ * not loaded.  Vold triggers init to load these properties once it
+ * has mounted /data.
+ */
+void load_persist_props(void)
+{
+    load_properties_from_file(PROP_PATH_LOCAL_OVERRIDE);
+    /* Read persistent properties after all default values have been loaded. */
+    load_persistent_properties();
 }
 
 void start_property_service(void)

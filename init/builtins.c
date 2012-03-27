@@ -163,6 +163,12 @@ int do_class_stop(int nargs, char **args)
     return 0;
 }
 
+int do_class_reset(int nargs, char **args)
+{
+    service_for_each_class(args[1], service_reset);
+    return 0;
+}
+
 int do_domainname(int nargs, char **args)
 {
     return write_file("/proc/sys/kernel/domainname", args[1]);
@@ -261,6 +267,7 @@ int do_import(int nargs, char **args)
 int do_mkdir(int nargs, char **args)
 {
     mode_t mode = 0755;
+    int ret;
 
     /* mkdir <path> [mode] [owner] [group] */
 
@@ -268,7 +275,12 @@ int do_mkdir(int nargs, char **args)
         mode = strtoul(args[2], 0, 8);
     }
 
-    if (mkdir(args[1], mode)) {
+    ret = mkdir(args[1], mode);
+    /* chmod in case the directory already exists */
+    if (ret == -1 && errno == EEXIST) {
+        ret = chmod(args[1], mode);
+    }
+    if (ret == -1) {
         return -errno;
     }
 
@@ -303,6 +315,8 @@ static struct {
     { "defaults",   0 },
     { 0,            0 },
 };
+
+#define DATA_MNT_POINT "/data"
 
 /* mount <type> <device> <path> <flags ...> <options> */
 int do_mount(int nargs, char **args)
@@ -412,7 +426,24 @@ int do_setkey(int nargs, char **args)
 
 int do_setprop(int nargs, char **args)
 {
-    property_set(args[1], args[2]);
+    const char *name = args[1];
+    const char *value = args[2];
+
+    if (value[0] == '$') {
+        /* Use the value of a system property if value starts with '$' */
+        value++;
+        if (value[0] != '$') {
+            value = property_get(value);
+            if (!value) {
+                ERROR("property %s has no value for assigning to %s\n", value, name);
+                return -EINVAL;
+            }
+        } /* else fall through to support double '$' prefix for setting properties
+           * to string literals that start with '$'
+           */
+    }
+
+    property_set(name, value);
     return 0;
 }
 
@@ -468,6 +499,16 @@ int do_symlink(int nargs, char **args)
     return symlink(args[1], args[2]);
 }
 
+int do_rm(int nargs, char **args)
+{
+    return unlink(args[1]);
+}
+
+int do_rmdir(int nargs, char **args)
+{
+    return rmdir(args[1]);
+}
+
 int do_sysclktz(int nargs, char **args)
 {
     struct timezone tz;
@@ -484,7 +525,23 @@ int do_sysclktz(int nargs, char **args)
 
 int do_write(int nargs, char **args)
 {
-    return write_file(args[1], args[2]);
+    const char *path = args[1];
+    const char *value = args[2];
+    if (value[0] == '$') {
+        /* Write the value of a system property if value starts with '$' */
+        value++;
+        if (value[0] != '$') {
+            value = property_get(value);
+            if (!value) {
+                ERROR("property %s has no value for writing to %s\n", value, path);
+                return -EINVAL;
+            }
+        } /* else fall through to support double '$' prefix for writing
+           * string literals that start with '$'
+           */
+    }
+
+    return write_file(path, value);
 }
 
 int do_copy(int nargs, char **args)
@@ -587,6 +644,14 @@ int do_chmod(int nargs, char **args) {
 int do_loglevel(int nargs, char **args) {
     if (nargs == 2) {
         log_set_level(atoi(args[1]));
+        return 0;
+    }
+    return -1;
+}
+
+int do_load_persist_props(int nargs, char **args) {
+    if (nargs == 1) {
+        load_persist_props();
         return 0;
     }
     return -1;
